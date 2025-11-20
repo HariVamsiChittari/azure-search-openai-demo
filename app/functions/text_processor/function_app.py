@@ -11,6 +11,10 @@ from typing import Any
 
 import azure.functions as func
 from azure.identity.aio import ManagedIdentityCredential
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.openai import OpenAIInstrumentor
 
 from prepdocslib.blobmanager import BlobManager
 from prepdocslib.embeddings import OpenAIEmbeddings
@@ -289,8 +293,33 @@ async def process_document(data: dict[str, Any]) -> list[dict[str, Any]]:
     return outputs
 
 
-# Initialize settings at module load time, unless we're in a test environment
+# Initialize settings and configure monitoring
 if os.environ.get("PYTEST_CURRENT_TEST") is None:
+    # Configure Azure Monitor telemetry
+    if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
+        logger.info("APPLICATIONINSIGHTS_CONNECTION_STRING is set, enabling Azure Monitor")
+        configure_azure_monitor(
+            instrumentation_options={
+                "django": {"enabled": False},
+                "psycopg2": {"enabled": False},
+                "fastapi": {"enabled": False},
+            }
+        )
+        # This tracks HTTP requests made by aiohttp:
+        AioHttpClientInstrumentor().instrument()
+        # This tracks HTTP requests made by httpx:
+        HTTPXClientInstrumentor().instrument()
+        # This tracks OpenAI SDK requests:
+        OpenAIInstrumentor().instrument()
+
+    # Log levels should be one of https://docs.python.org/3/library/logging.html#logging-levels
+    # Set root level to WARNING to avoid seeing overly verbose logs from SDKS
+    logging.basicConfig(level=logging.WARNING)
+    # Set our own logger levels to INFO by default
+    app_level = os.getenv("APP_LOG_LEVEL", "INFO")
+    logger.setLevel(app_level)
+    logging.getLogger("scripts").setLevel(app_level)
+
     try:
         configure_global_settings()
     except KeyError as e:

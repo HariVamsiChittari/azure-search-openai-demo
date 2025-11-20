@@ -18,6 +18,10 @@ from typing import Any
 
 import azure.functions as func
 from azure.identity.aio import ManagedIdentityCredential, get_bearer_token_provider
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.openai import OpenAIInstrumentor
 
 from prepdocslib.blobmanager import BlobManager
 from prepdocslib.embeddings import ImageEmbeddings
@@ -190,6 +194,24 @@ async def process_figure_request(req: func.HttpRequest) -> func.HttpResponse:
 
 # Initialize settings at module load time, unless we're in a test environment
 if os.environ.get("PYTEST_CURRENT_TEST") is None:
+    if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
+        logger.info("APPLICATIONINSIGHTS_CONNECTION_STRING is set, enabling Azure Monitor")
+        configure_azure_monitor(
+            instrumentation_options={
+                "django": {"enabled": False},
+                "psycopg2": {"enabled": False},
+                "fastapi": {"enabled": False},
+            }
+        )
+        AioHttpClientInstrumentor().instrument()
+        HTTPXClientInstrumentor().instrument()
+        OpenAIInstrumentor().instrument()
+
+    logging.basicConfig(level=logging.WARNING)
+    app_level = os.getenv("APP_LOG_LEVEL", "INFO")
+    logger.setLevel(app_level)
+    logging.getLogger("scripts").setLevel(app_level)
+
     try:
         configure_global_settings()
     except KeyError as e:

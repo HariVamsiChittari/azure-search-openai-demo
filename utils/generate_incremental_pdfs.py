@@ -11,7 +11,8 @@ def generate_incremental_pdfs(
     start_mb,
     increment_mb,
     count,
-    validate=False
+    validate=False,
+    add_images=False
 ):
     """Generate multiple PDFs with incrementally increasing sizes.
     
@@ -22,6 +23,7 @@ def generate_incremental_pdfs(
         increment_mb: Size increment in MB for each file
         count: Number of files to generate
         validate: Whether to validate each generated PDF
+        add_images: Whether to embed large images to guarantee target file size
     """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -64,6 +66,9 @@ def generate_incremental_pdfs(
         
         if validate:
             cmd.append("--validate")
+        
+        if add_images:
+            cmd.append("--add-images")
         
         # Execute the command
         try:
@@ -133,14 +138,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Validate each generated PDF"
     )
+    parser.add_argument(
+        "--add-images",
+        action="store_true",
+        help="Embed large images to guarantee target file size (slower)"
+    )
     
     args = parser.parse_args()
     
-    generate_incremental_pdfs(
-        input_path=args.input,
-        output_dir=args.output_dir,
-        start_mb=args.start_mb,
-        increment_mb=args.increment_mb,
-        count=args.count,
-        validate=args.validate
-    )
+    try:
+        generate_incremental_pdfs(
+            input_path=args.input,
+            output_dir=args.output_dir,
+            start_mb=args.start_mb,
+            increment_mb=args.increment_mb,
+            count=args.count,
+            validate=args.validate,
+            add_images=args.add_images,
+        )
+    except Exception as e:
+        print(f"\n✗ Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)

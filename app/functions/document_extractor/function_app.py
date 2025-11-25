@@ -210,16 +210,30 @@ async def process_document(data: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Dictionary with pages and figures (with URLs if uploaded, base64 if not)
     """
+    # Log available fields for debugging
+    logger.info("Available input fields: %s", list(data.keys()))
+    
     # Try file_data first (for small files), fall back to blob URL (for large files)
     if "file_data" in data and data.get("file_data", {}).get("data"):
         document_stream, file_name, content_type = get_document_stream_filedata(data)
     elif "metadata_storage_path" in data:
-        document_stream, file_name, content_type = await get_document_stream_from_blob_url(data)
+        document_stream, file_name, content_type = await get_document_stream_from_blob_url(data, "metadata_storage_path")
+    elif "normalized_images" in data and "metadata_storage_path" in data.get("normalized_images", {}):
+        # Handle Azure Search normalized_images format
+        document_stream, file_name, content_type = await get_document_stream_from_blob_url(data["normalized_images"], "metadata_storage_path")
+    elif any(key.endswith("_path") for key in data.keys()):
+        # Try to find any field ending with _path that might contain blob URL
+        path_key = next((k for k in data.keys() if k.endswith("_path")), None)
+        logger.info("Found alternative path field: %s", path_key)
+        document_stream, file_name, content_type = await get_document_stream_from_blob_url(data, path_key)
     else:
+        # Provide detailed error message with available fields
+        available_fields = ", ".join(data.keys()) if data else "none"
         raise ValueError(
-            "Input must contain either 'file_data' with base64 data or 'metadata_storage_path' with blob URL. "
-            "For files larger than 16MB, the indexer cannot send file_data inline. "
-            "Update your skillset to pass 'metadata_storage_path' for large files."
+            f"Input must contain either 'file_data' with base64 data or 'metadata_storage_path' with blob URL. "
+            f"For files larger than 16MB, the indexer cannot send file_data inline. "
+            f"Available fields in input: {available_fields}. "
+            f"Update your skillset to pass 'metadata_storage_path' or configure file data enrichment."
         )
     
     file_size_mb = len(document_stream.getvalue()) / (1024 * 1024)
@@ -254,21 +268,34 @@ async def process_document(data: dict[str, Any]) -> dict[str, Any]:
     return components
 
 
-async def get_document_stream_from_blob_url(data: dict[str, Any]) -> tuple[io.BytesIO, str, str]:
-    """Download document from blob storage using metadata_storage_path."""
+async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str = "metadata_storage_path") -> tuple[io.BytesIO, str, str]:
+    """Download document from blob storage using metadata_storage_path or other URL field."""
     if settings.blob_service_client is None:
         raise ValueError("Blob storage not configured. Set AZURE_STORAGE_ACCOUNT environment variable.")
     
-    blob_url = data.get("metadata_storage_path")
+    blob_url = data.get(url_field)
     if not blob_url:
-        raise ValueError("metadata_storage_path not found in input data")
+        raise ValueError(f"{url_field} not found in input data")
+    
+    logger.info("Downloading from blob URL field '%s': %s", url_field, blob_url)
     
     # Parse blob URL: https://account.blob.core.windows.net/container/path/file.pdf
-    url_parts = blob_url.split("/")
+    # Handle both full URLs and SAS URLs
+    url_parts = blob_url.split("?")[0].split("/")  # Remove SAS token if present
+    
+    if len(url_parts) < 5:
+        raise ValueError(f"Invalid blob URL format: {blob_url}")
+    
     container_name = url_parts[3]
     blob_name = "/".join(url_parts[4:])
     
-    file_name = data.get("metadata_storage_name") or blob_name.split("/")[-1]
+    # Try multiple possible name fields
+    file_name = (
+        data.get("metadata_storage_name") or 
+        data.get("file_name") or 
+        data.get("fileName") or 
+        blob_name.split("/")[-1]
+    )
     
     logger.info("Downloading from blob: %s/%s", container_name, blob_name)
     
@@ -277,13 +304,13 @@ async def get_document_stream_from_blob_url(data: dict[str, Any]) -> tuple[io.By
     try:
         download_stream = await blob_client.download_blob()
         blob_bytes = await download_stream.readall()
-        logger.info("Downloaded %d bytes", len(blob_bytes))
+        logger.info("Downloaded %d bytes for file: %s", len(blob_bytes), file_name)
         
         stream = io.BytesIO(blob_bytes)
         stream.name = file_name
         return stream, file_name, "application/pdf"
     except Exception as e:
-        logger.error("Failed to download blob: %s", str(e), exc_info=True)
+        logger.error("Failed to download blob %s/%s: %s", container_name, blob_name, str(e), exc_info=True)
         raise ValueError(f"Failed to download from blob storage: {str(e)}") from e
 
 

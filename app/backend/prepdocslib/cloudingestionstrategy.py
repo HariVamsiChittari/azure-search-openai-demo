@@ -160,9 +160,12 @@ class CloudIngestionStrategy(Strategy):  # pragma: no cover
             ),
             inputs=[
                 # Provide the binary payload expected by the document extractor custom skill.
+                # For files < 16MB, file_data will contain the base64 encoded content
                 InputFieldMappingEntry(name="file_data", source="/document/file_data"),
                 InputFieldMappingEntry(name="file_name", source="/document/metadata_storage_name"),
                 InputFieldMappingEntry(name="content_type", source="/document/metadata_storage_content_type"),
+                # For files >= 16MB, file_data may be empty - pass the blob URL instead
+                InputFieldMappingEntry(name="metadata_storage_path", source="/document/metadata_storage_path"),
             ],
             outputs=[
                 OutputFieldMappingEntry(name="pages", target_name="pages"),

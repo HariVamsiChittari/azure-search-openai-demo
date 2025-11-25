@@ -90,10 +90,14 @@ def add_page_number_overlay(page, page_number, add_large_image=False):
         from reportlab.lib.utils import ImageReader
         import random
         
-        # Create a 1000x1000 image with unique random noise based on page number
+        # Calculate appropriate image size based on needs
+        # Each pixel in RGB = 3 bytes. Target ~150KB per image for ~100MB per ~650 pages
+        # 150KB / 3 bytes = 50,000 pixels = ~224x224 image
+        img_size = (250, 250)  # Adjusted from 1000x1000 to reduce size
+        
+        # Create image with unique random noise based on page number
         random.seed(page_number)
-        img_size = (1000, 1000)
-        img_data = bytes([random.randint(250, 255) for _ in range(img_size[0] * img_size[1] * 3)])
+        img_data = bytes([random.randint(240, 255) for _ in range(img_size[0] * img_size[1] * 3)])
         img = Image.frombytes('RGB', img_size, img_data)
         
         # Wrap in ImageReader for reportlab

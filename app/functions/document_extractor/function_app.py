@@ -10,6 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote
 
 import azure.functions as func
 from azure.core.exceptions import HttpResponseError
@@ -287,7 +288,9 @@ async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str
         raise ValueError(f"Invalid blob URL format: {blob_url}")
     
     container_name = url_parts[3]
-    blob_name = "/".join(url_parts[4:])
+    # URL decode the blob name to handle spaces and special characters
+    blob_name_encoded = "/".join(url_parts[4:])
+    blob_name = unquote(blob_name_encoded)
     
     # Try multiple possible name fields
     file_name = (
@@ -297,7 +300,7 @@ async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str
         blob_name.split("/")[-1]
     )
     
-    logger.info("Downloading from blob: %s/%s", container_name, blob_name)
+    logger.info("Downloading from blob: container='%s', blob='%s' (decoded from '%s')", container_name, blob_name, blob_name_encoded)
     
     blob_client = settings.blob_service_client.get_blob_client(container=container_name, blob=blob_name)
     

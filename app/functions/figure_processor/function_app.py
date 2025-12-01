@@ -13,6 +13,7 @@ This function:
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -132,6 +133,12 @@ def configure_global_settings():
 @app.route(route="process", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 async def process_figure_request(req: func.HttpRequest) -> func.HttpResponse:
     """Entrypoint for Azure Search custom skill calls."""
+    start_time = time.time()
+    figure_id = "unknown"
+    source_file = "unknown"
+    page_num = -1
+    figure_size_kb = 0.0
+    status = "unknown"
 
     if settings is None:
         return func.HttpResponse(
@@ -174,15 +181,76 @@ async def process_figure_request(req: func.HttpRequest) -> func.HttpResponse:
                     "warnings": [],
                 }
             )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error("Error processing figure %s: %s", record_id, exc, exc_info=True)
-            output_values.append(
-                {
-                    "recordId": record_id,
-                    "data": {},
-                    "errors": [{"message": str(exc)}],
-                    "warnings": [],
-                }
+
+            figure_id = data.get("figure_id", "unknown")
+            source_file = data.get("document_file_name", "unknown")
+            page_num = data.get("page_num", -1)
+
+            # Calculate figure size if base64 data is present
+            bytes_base64 = data.get("bytes_base64", "")
+            if bytes_base64:
+                # Base64 encoding increases size by ~33%, so decoded size is roughly len * 0.75
+                figure_size_kb = (len(bytes_base64) * 0.75) / 1024
+
+            logger.info(
+                "[METRICS] function=figure_processor | operation=start | source_file=%s | figure_id=%s | "
+                "page=%d | size_kb=%.2f | recordId=%s",
+                source_file, figure_id, page_num, figure_size_kb, record_id
+            )
+
+            try:
+                process_start = time.time()
+                result = await process_single_figure(data)
+                process_duration = time.time() - process_start
+                status = "success"
+
+                has_description = bool(result.get("description"))
+                has_embedding = bool(result.get("embedding"))
+
+                logger.info(
+                    "[METRICS] function=figure_processor | operation=complete | source_file=%s | figure_id=%s | "
+                    "page=%d | status=%s | duration_sec=%.2f | size_kb=%.2f | has_description=%s | has_embedding=%s",
+                    source_file, figure_id, page_num, status, process_duration, figure_size_kb,
+                    has_description, has_embedding
+                )
+
+                # ...existing code...
+            except Exception as e:
+                process_duration = time.time() - start_time
+                status = "error"
+                error_type = type(e).__name__
+
+                logger.error(
+                    "[METRICS] function=figure_processor | operation=complete | source_file=%s | figure_id=%s | "
+                    "page=%d | status=%s | duration_sec=%.2f | size_kb=%.2f | error_type=%s | error_message=%s",
+                    source_file, figure_id, page_num, status, process_duration, figure_size_kb,
+                    error_type, str(e), exc_info=True
+                )
+
+                # ...existing code...
+
+            total_duration = time.time() - start_time
+            logger.info(
+                "[METRICS] function=figure_processor | operation=request_complete | source_file=%s | figure_id=%s | "
+                "status=%s | total_duration_sec=%.2f | size_kb=%.2f",
+                source_file, figure_id, status, total_duration, figure_size_kb
+            )
+
+        except Exception as e:
+            total_duration = time.time() - start_time
+            status = "fatal_error"
+            error_type = type(e).__name__
+
+            logger.error(
+                "[METRICS] function=figure_processor | operation=request_complete | source_file=%s | figure_id=%s | "
+                "status=%s | total_duration_sec=%.2f | size_kb=%.2f | error_type=%s | error_message=%s",
+                source_file, figure_id, status, total_duration, figure_size_kb, error_type, str(e), exc_info=True
+            )
+
+            return func.HttpResponse(
+                json.dumps({"values": output_values}),
+                mimetype="application/json",
+                status_code=200,
             )
 
     return func.HttpResponse(

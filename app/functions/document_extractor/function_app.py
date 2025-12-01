@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
@@ -102,58 +103,12 @@ def configure_global_settings():
 @app.function_name(name="extract")
 @app.route(route="extract", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Azure Search Custom Skill: Extract document content
-
-    Input format (single record; file data only):
-    # https://learn.microsoft.com/azure/search/cognitive-search-skill-document-intelligence-layout#skill-inputs
-    {
-        "values": [
-            {
-                "recordId": "1",
-                "data": {
-                    // Base64 encoded file (skillset must enable file data)
-                    "file_data": {
-                        "$type": "file",
-                        "data": "base64..."
-                    },
-                    // Optional
-                    "file_name": "doc.pdf"
-                }
-            }
-        ]
-    }
-
-    Output format (snake_case only):
-    {
-        "values": [
-            {
-                "recordId": "1",
-                "data": {
-                    "pages": [
-                        {"page_num": 0, "text": "Page 1 text", "figure_ids": ["fig1"]},
-                        {"page_num": 1, "text": "Page 2 text", "figure_ids": []}
-                    ],
-                    "figures": [
-                        {
-                            "figure_id": "fig1",
-                            "page_num": 0,
-                            "document_file_name": "doc.pdf",
-                            "filename": "fig1.png",
-                            "mime_type": "image/png",
-                            "bytes_base64": "...",
-                            "bbox": [100,150,300,400],
-                            "title": "Figure Title",
-                            "placeholder": "<figure id=\"fig1\"></figure>"
-                        }
-                    ]
-                },
-                "errors": [],
-                "warnings": []
-            }
-        ]
-    }
-    """
+    """Azure Search Custom Skill: Extract document content"""
+    start_time = time.time()
+    file_name = "unknown"
+    file_size_mb = 0.0
+    status = "unknown"
+    
     if settings is None:
         return func.HttpResponse(
             json.dumps({"error": "Settings not initialized"}),
@@ -173,8 +128,34 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
         record_id = input_record.get("recordId", "")
         data = input_record.get("data", {})
 
+        # Extract file name early for metrics
+        file_name = (
+            data.get("metadata_storage_name") or 
+            data.get("file_name") or 
+            data.get("fileName") or
+            "unknown"
+        )
+        
+        logger.info(
+            "[METRICS] function=document_extractor | operation=start | file=%s | recordId=%s",
+            file_name, record_id
+        )
+
         try:
+            process_start = time.time()
             result = await process_document(data)
+            process_duration = time.time() - process_start
+            
+            num_pages = len(result.get("pages", []))
+            num_figures = len(result.get("figures", []))
+            status = "success"
+            
+            logger.info(
+                "[METRICS] function=document_extractor | operation=complete | file=%s | status=%s | "
+                "duration_sec=%.2f | pages=%d | figures=%d | size_mb=%.2f",
+                file_name, status, process_duration, num_pages, num_figures, file_size_mb
+            )
+            
             output_values = [
                 {
                     "recordId": record_id,
@@ -185,6 +166,16 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
             ]
         except Exception as e:
             logger.error("Error processing record %s: %s", record_id, str(e), exc_info=True)
+            process_duration = time.time() - start_time
+            status = "error"
+            error_type = type(e).__name__
+            
+            logger.error(
+                "[METRICS] function=document_extractor | operation=complete | file=%s | status=%s | "
+                "duration_sec=%.2f | size_mb=%.2f | error_type=%s | error_message=%s",
+                file_name, status, process_duration, file_size_mb, error_type, str(e), exc_info=True
+            )
+            
             output_values = [
                 {
                     "recordId": record_id,
@@ -194,24 +185,34 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
                 }
             ]
 
+        total_duration = time.time() - start_time
+        logger.info(
+            "[METRICS] function=document_extractor | operation=request_complete | file=%s | status=%s | "
+            "total_duration_sec=%.2f | size_mb=%.2f",
+            file_name, status, total_duration, file_size_mb
+        )
+        
         return func.HttpResponse(json.dumps({"values": output_values}), mimetype="application/json", status_code=200)
 
     except Exception as e:
-        logger.error("Fatal error in extract_document: %s", str(e), exc_info=True)
+        total_duration = time.time() - start_time
+        status = "fatal_error"
+        error_type = type(e).__name__
+        
+        logger.error(
+            "[METRICS] function=document_extractor | operation=request_complete | file=%s | status=%s | "
+            "total_duration_sec=%.2f | size_mb=%.2f | error_type=%s | error_message=%s",
+            file_name, status, total_duration, file_size_mb, error_type, str(e), exc_info=True
+        )
+        
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
 
 
 async def process_document(data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Process a single document: download, parse, extract figures, upload images
-
-    Args:
-        data: Input data with file_data (small files) or metadata_storage_path (large files)
-
-    Returns:
-        Dictionary with pages and figures (with URLs if uploaded, base64 if not)
-    """
-    # Log available fields for debugging
+    """Process a single document: download, parse, extract figures, upload images"""
+    file_name = "unknown"
+    download_start = time.time()
+    
     logger.info("Available input fields: %s", list(data.keys()))
     
     # Try file_data first (for small files), fall back to blob URL (for large files)
@@ -237,8 +238,14 @@ async def process_document(data: dict[str, Any]) -> dict[str, Any]:
             f"Update your skillset to pass 'metadata_storage_path' or configure file data enrichment."
         )
     
+    download_duration = time.time() - download_start
     file_size_mb = len(document_stream.getvalue()) / (1024 * 1024)
-    logger.info("Processing document: %s (%.2f MB)", file_name, file_size_mb)
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=download | file=%s | "
+        "size_mb=%.2f | duration_sec=%.2f | throughput_mbps=%.2f",
+        file_name, file_size_mb, download_duration, file_size_mb / max(download_duration, 0.001)
+    )
 
     # Get parser from file_processors dict based on file extension
     file_processor = select_processor_for_filename(file_name, settings.file_processors)
@@ -263,9 +270,27 @@ async def process_document(data: dict[str, Any]) -> dict[str, Any]:
 
     logger.info("Successfully parsed %d pages from %s", len(pages), file_name)
     
-    # Upload extracted images to blob storage if blob manager is configured
+    parse_duration = time.time() - download_start
+    avg_per_page = parse_duration / max(len(pages), 1)
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=parse | file=%s | "
+        "pages=%d | duration_sec=%.2f | avg_per_page_sec=%.2f | size_mb=%.2f",
+        file_name, len(pages), parse_duration, avg_per_page, file_size_mb
+    )
+    
     upload_images = settings.blob_manager is not None
+    build_start = time.time()
     components = await build_document_components(file_name, pages, upload_images)
+    build_duration = time.time() - build_start
+    
+    num_figures = len(components.get("figures", []))
+    logger.info(
+        "[METRICS] function=document_extractor | operation=build_components | file=%s | "
+        "duration_sec=%.2f | figures=%d | size_mb=%.2f",
+        file_name, build_duration, num_figures, file_size_mb
+    )
+    
     return components
 
 

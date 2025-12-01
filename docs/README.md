@@ -15,6 +15,7 @@ These are advanced topics that are not necessary for a basic deployment.
     - [Multimodal](multimodal.md)
     - [Private endpoints](deploy_private.md)
     - [Agentic retrieval](agentic_retrieval.md)
+    - [Agent framework](agent_framework_complete_guide.md)
   - [Sharing deployment environments](sharing_environments.md)
 - [Local development](localdev.md)
 - [Customizing the app](customization.md)

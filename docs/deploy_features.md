@@ -5,6 +5,7 @@ You should typically enable these features before running `azd up`. Once you've 
 
 * [Using different chat completion models](#using-different-chat-completion-models)
 * [Using reasoning models](#using-reasoning-models)
+* [Using the agent framework](#using-the-agent-framework)
 * [Using different embedding models](#using-different-embedding-models)
 * [Enabling multimodal embeddings and answering](#enabling-multimodal-embeddings-and-answering)
 * [Enabling media description with Azure Content Understanding](#enabling-media-description-with-azure-content-understanding)
@@ -153,6 +154,20 @@ To enable reasoning models, follow the steps in [the reasoning models guide](./r
 ## Using agentic retrieval
 
 This feature allows you to use agentic retrieval in place of the Search API. To enable agentic retrieval, follow the steps in [the agentic retrieval guide](./agentic_retrieval.md)
+
+## Using the agent framework
+
+This feature enables an agent-based orchestration layer that can intelligently route user queries through multiple tools (search, calculator, code interpreter, etc.) to provide more comprehensive answers. The agent framework builds on top of the existing RAG approaches and adds dynamic tool selection capabilities.
+
+To enable the agent framework, run:
+
+```shell
+azd env set AGENT_FRAMEWORK_ENABLED true
+```
+
+Then run `azd up` to deploy the changes.
+
+For detailed information about the agent framework architecture, available tools, and customization options, see the [Agent Framework Complete Guide](./agent_framework_complete_guide.md).
 
 ## Using different embedding models
 

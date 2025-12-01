@@ -358,6 +358,9 @@
     },
     "useSharePointSource": {
       "value": "${USE_SHAREPOINT_SOURCE=false}"
+    },
+    "agentFrameworkEnabled": {
+      "value": "${AGENT_FRAMEWORK_ENABLED=false}"
     }
   }
 }

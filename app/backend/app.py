@@ -21,6 +21,11 @@ from azure.identity.aio import (
     ManagedIdentityCredential,
     get_bearer_token_provider,
 )
+# Import synchronous credentials for agent_framework (non-async)
+from azure.identity import (
+    AzureDeveloperCliCredential as SyncAzureDeveloperCliCredential,
+    ManagedIdentityCredential as SyncManagedIdentityCredential,
+)
 from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.search.documents.aio import SearchClient
 from azure.search.documents.indexes.aio import SearchIndexClient
@@ -46,11 +51,14 @@ from quart_cors import cors
 
 from approaches.approach import Approach, DataPoints
 from approaches.chatreadretrieveread import ChatReadRetrieveReadApproach
+from approaches.agents import AgentOrchestrator
 from approaches.promptmanager import PromptyManager
 from approaches.retrievethenread import RetrieveThenReadApproach
 from chat_history.cosmosdb import chat_history_cosmosdb_bp
 from config import (
     CONFIG_AGENTIC_KNOWLEDGEBASE_ENABLED,
+    CONFIG_AGENT_FRAMEWORK_ENABLED,
+    CONFIG_AGENT_ORCHESTRATOR,
     CONFIG_ASK_APPROACH,
     CONFIG_AUTH_CLIENT,
     CONFIG_CHAT_APPROACH,
@@ -757,7 +765,7 @@ async def setup_clients():
     )
 
     # ChatReadRetrieveReadApproach is used by /chat for multi-turn conversation
-    current_app.config[CONFIG_CHAT_APPROACH] = ChatReadRetrieveReadApproach(
+    chat_approach = ChatReadRetrieveReadApproach(
         search_client=search_client,
         search_index_name=AZURE_SEARCH_INDEX,
         knowledgebase_model=AZURE_OPENAI_KNOWLEDGEBASE_MODEL,
@@ -787,6 +795,58 @@ async def setup_clients():
         use_sharepoint_source=current_app.config[CONFIG_SHAREPOINT_SOURCE_ENABLED],
         retrieval_reasoning_effort=AGENTIC_KNOWLEDGEBASE_REASONING_EFFORT,
     )
+    current_app.config[CONFIG_CHAT_APPROACH] = chat_approach
+
+    # Set up agent framework orchestration if enabled
+    AGENT_FRAMEWORK_ENABLED = os.getenv("AGENT_FRAMEWORK_ENABLED", "").lower() == "true"
+    current_app.config[CONFIG_AGENT_FRAMEWORK_ENABLED] = AGENT_FRAMEWORK_ENABLED
+
+    if AGENT_FRAMEWORK_ENABLED:
+        current_app.logger.info("AGENT_FRAMEWORK_ENABLED is true, setting up agent orchestrator")
+
+        # Get Azure OpenAI endpoint for orchestration agent
+        orchestration_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        if not orchestration_endpoint:
+            if AZURE_OPENAI_SERVICE:
+                orchestration_endpoint = f"https://{AZURE_OPENAI_SERVICE}.openai.azure.com"
+            else:
+                raise ValueError(
+                    "AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_SERVICE must be set when AGENT_FRAMEWORK_ENABLED is true"
+                )
+
+        # Create a synchronous credential for agent_framework (it doesn't support async credentials)
+        sync_credential = None
+        if not AZURE_OPENAI_API_KEY_OVERRIDE:
+            # Mirror the credential setup logic from earlier in the file
+            if RUNNING_ON_AZURE:
+                if AZURE_CLIENT_ID := os.getenv("AZURE_CLIENT_ID"):
+                    sync_credential = SyncManagedIdentityCredential(client_id=AZURE_CLIENT_ID)
+                else:
+                    sync_credential = SyncManagedIdentityCredential()
+            elif AZURE_TENANT_ID:
+                sync_credential = SyncAzureDeveloperCliCredential(tenant_id=AZURE_TENANT_ID, process_timeout=60)
+            else:
+                sync_credential = SyncAzureDeveloperCliCredential(process_timeout=60)
+
+        # Create agent orchestrator
+        agent_orchestrator = AgentOrchestrator(
+            chat_approach=chat_approach,
+            ask_approach=current_app.config[CONFIG_ASK_APPROACH],
+            openai_endpoint=orchestration_endpoint,
+            openai_deployment=AZURE_OPENAI_CHATGPT_DEPLOYMENT or OPENAI_CHATGPT_MODEL,
+            prompt_manager=prompt_manager,
+            search_client=current_app.config[CONFIG_SEARCH_CLIENT],
+            openai_client=current_app.config[CONFIG_OPENAI_CLIENT],
+            embedding_deployment=AZURE_OPENAI_EMB_DEPLOYMENT or "text-embedding-3-large",
+            credential_provider=sync_credential,
+            api_key=AZURE_OPENAI_API_KEY_OVERRIDE,
+        )
+        current_app.config[CONFIG_AGENT_ORCHESTRATOR] = agent_orchestrator
+
+        # Override the chat and ask approaches with agent orchestrator when enabled
+        current_app.config[CONFIG_CHAT_APPROACH] = agent_orchestrator
+        current_app.config[CONFIG_ASK_APPROACH] = agent_orchestrator
+        current_app.logger.info("Agent orchestrator is now active for /chat and /ask endpoints")
 
 
 @bp.after_app_serving

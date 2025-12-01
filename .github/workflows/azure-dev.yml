@@ -118,6 +118,7 @@ jobs:
       USE_AGENTIC_KNOWLEDGEBASE: ${{ vars.USE_AGENTIC_KNOWLEDGEBASE }}
       USE_WEB_SOURCE: ${{ vars.USE_WEB_SOURCE }}
       USE_SHAREPOINT_SOURCE: ${{ vars.USE_SHAREPOINT_SOURCE }}
+      AGENT_FRAMEWORK_ENABLED: ${{ vars.AGENT_FRAMEWORK_ENABLED }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5

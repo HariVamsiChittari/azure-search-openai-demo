@@ -1333,41 +1333,13 @@ az containerapp logs show --name <app-name> --resource-group <rg>
 
 ---
 
-## Appendix A: Naming Convention Summary
-
-### Class Names
-| Old Name | New Name |
-|----------|----------|
-| `OrchestrationApproach` | `AgentOrchestrator` |
-| `MainOrchestrationAgent` | `SupervisorAgent` |
-| `SearchAgent` | `DocumentSearchAgent` |
-| `TraversalAgent` | `GraphTraversalAgent` |
-
-### Method/Function Names
-| Old Name | New Name |
-|----------|----------|
-| `get_ai_search_query` | `search_knowledge_base` |
-| `dummy_traversal_tool` | `traverse_knowledge_graph` |
-| `route_to_search_agent` | `delegate_to_search_agent` |
-| `route_to_traversal_agent` | `delegate_to_traversal_agent` |
-
-### File Names
-| Old File | New File |
-|----------|----------|
-| `orchestrationapproach.py` | `agents/agent_orchestrator.py` |
-| `orchestration_main.prompty` | `agents/supervisor_agent.prompty` |
-| `orchestration_search_agent.prompty` | `agents/document_search_agent.prompty` |
-| `orchestration_traversal_agent.prompty` | `agents/graph_traversal_agent.prompty` |
-
----
-
 ## Appendix B: Approach Comparison
 
 | Feature | RetrieveThenRead | ChatReadRetrieveRead | AgentOrchestrator |
 |---------|------------------|----------------------|-------------------|
 | **Endpoint** | `/ask` | `/chat`, `/chat/stream` | Both (overrides) |
 | **Query Rewriting** | ❌ | ✅ | ✅ (via sub-agents) |
-| **Conversation History** | ❌ | ✅ | ✅ |
+| **Conversation History** | ❌ | ✅ | ❌ |
 | **Streaming** | ❌ | ✅ | ✅ |
 | **Multi-Agent Routing** | ❌ | ❌ | ✅ |
 | **Extensibility** | Low | Medium | High |
@@ -1387,5 +1359,4 @@ az containerapp logs show --name <app-name> --resource-group <rg>
 ---
 
 *Document Version: 1.0*  
-*Last Updated: December 2025*  
-*Author: AI Agent Framework Implementation Team*
+*Last Updated: December 2025* 

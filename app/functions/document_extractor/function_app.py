@@ -143,7 +143,7 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
 
         try:
             process_start = time.time()
-            result = await process_document(data)
+            result, file_size_mb = await process_document(data)
             process_duration = time.time() - process_start
             
             num_pages = len(result.get("pages", []))
@@ -151,7 +151,7 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
             status = "success"
             
             logger.info(
-                "[METRICS] function=document_extractor | operation=complete | file=%s | status=%s | "
+                "[METRICS] function=document_extractor | operation=processing_complete | file=%s | status=%s | "
                 "duration_sec=%.2f | pages=%d | figures=%d | size_mb=%.2f",
                 file_name, status, process_duration, num_pages, num_figures, file_size_mb
             )
@@ -171,7 +171,7 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
             error_type = type(e).__name__
             
             logger.error(
-                "[METRICS] function=document_extractor | operation=complete | file=%s | status=%s | "
+                "[METRICS] function=document_extractor | operation=processing_complete | file=%s | status=%s | "
                 "duration_sec=%.2f | size_mb=%.2f | error_type=%s | error_message=%s",
                 file_name, status, process_duration, file_size_mb, error_type, str(e), exc_info=True
             )
@@ -208,12 +208,15 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
 
 
-async def process_document(data: dict[str, Any]) -> dict[str, Any]:
+async def process_document(data: dict[str, Any]) -> tuple[dict[str, Any], float]:
     """Process a single document: download, parse, extract figures, upload images"""
     file_name = "unknown"
     download_start = time.time()
     
-    logger.info("Available input fields: %s", list(data.keys()))
+    logger.info(
+        "[METRICS] function=document_extractor | operation=input_analysis | available_fields=%s",
+        ", ".join(data.keys()) if data else "none"
+    )
     
     # Try file_data first (for small files), fall back to blob URL (for large files)
     if "file_data" in data and data.get("file_data", {}).get("data"):
@@ -274,7 +277,7 @@ async def process_document(data: dict[str, Any]) -> dict[str, Any]:
     avg_per_page = parse_duration / max(len(pages), 1)
     
     logger.info(
-        "[METRICS] function=document_extractor | operation=parse | file=%s | "
+        "[METRICS] function=document_extractor | operation=parse_complete | file=%s | "
         "pages=%d | duration_sec=%.2f | avg_per_page_sec=%.2f | size_mb=%.2f",
         file_name, len(pages), parse_duration, avg_per_page, file_size_mb
     )
@@ -291,7 +294,7 @@ async def process_document(data: dict[str, Any]) -> dict[str, Any]:
         file_name, build_duration, num_figures, file_size_mb
     )
     
-    return components
+    return components, file_size_mb
 
 
 async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str = "metadata_storage_path") -> tuple[io.BytesIO, str, str]:
@@ -303,7 +306,10 @@ async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str
     if not blob_url:
         raise ValueError(f"{url_field} not found in input data")
     
-    logger.info("Downloading from blob URL field '%s': %s", url_field, blob_url)
+    logger.info(
+        "[METRICS] function=document_extractor | operation=blob_download_start | url_field=%s | blob_url=%s",
+        url_field, blob_url
+    )
     
     # Parse blob URL: https://account.blob.core.windows.net/container/path/file.pdf
     # Handle both full URLs and SAS URLs
@@ -316,6 +322,11 @@ async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str
     # URL decode the blob name to handle spaces and special characters
     blob_name_encoded = "/".join(url_parts[4:])
     blob_name = unquote(blob_name_encoded)
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=blob_parse | container=%s | blob=%s | encoded_blob=%s",
+        container_name, blob_name, blob_name_encoded
+    )
     
     # Try multiple possible name fields
     file_name = (
@@ -332,13 +343,19 @@ async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str
     try:
         download_stream = await blob_client.download_blob()
         blob_bytes = await download_stream.readall()
-        logger.info("Downloaded %d bytes for file: %s", len(blob_bytes), file_name)
+        logger.info(
+            "[METRICS] function=document_extractor | operation=blob_download_complete | file=%s | size_bytes=%d",
+            file_name, len(blob_bytes)
+        )
         
         stream = io.BytesIO(blob_bytes)
         stream.name = file_name
         return stream, file_name, "application/pdf"
     except Exception as e:
-        logger.error("Failed to download blob %s/%s: %s", container_name, blob_name, str(e), exc_info=True)
+        logger.error(
+            "[METRICS] function=document_extractor | operation=blob_download_failed | container=%s | blob=%s | error=%s",
+            container_name, blob_name, str(e), exc_info=True
+        )
         raise ValueError(f"Failed to download from blob storage: {str(e)}") from e
 
 
@@ -359,7 +376,10 @@ def get_document_stream_filedata(data: dict[str, Any]) -> tuple[io.BytesIO, str,
     
     try:
         document_bytes = base64.b64decode(encoded)
-        logger.info("Decoded %d bytes from base64", len(document_bytes))
+        logger.info(
+            "[METRICS] function=document_extractor | operation=base64_decode_complete | size_bytes=%d",
+            len(document_bytes)
+        )
     except Exception as e:
         raise ValueError(f"Failed to decode base64 data: {str(e)}") from e
     
@@ -398,9 +418,15 @@ async def build_document_components(file_name: str, pages: list[Page], upload_im
                         # Remove base64 data to reduce response size
                         figure_payload.pop("bytes_base64", None)
                         figure_entries.append(figure_payload)
-                        logger.info("Uploaded image %s to blob storage", image.figure_id)
+                        logger.info(
+                            "[METRICS] function=document_extractor | operation=image_upload_success | file=%s | figure_id=%s",
+                            file_name, image.figure_id
+                        )
                     except Exception as e:
-                        logger.warning("Failed to upload image %s: %s", image.figure_id, str(e))
+                        logger.warning(
+                            "[METRICS] function=document_extractor | operation=image_upload_failed | file=%s | figure_id=%s | error=%s",
+                            file_name, image.figure_id, str(e)
+                        )
                         # Fall back to base64 if upload fails
                         figure_entries.append(image.to_skill_payload(file_name))
                 else:

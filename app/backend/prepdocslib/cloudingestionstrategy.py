@@ -161,9 +161,12 @@ class CloudIngestionStrategy(Strategy):  # pragma: no cover
                 resource_id=self.search_user_assigned_identity_resource_id
             ),
             inputs=[
-                # Provide the binary payload expected by the document extractor custom skill.
+                # Always provide the blob URL so the function can download large files
+                InputFieldMappingEntry(name="metadata_storage_path", source="/document/metadata_storage_path"),
+                InputFieldMappingEntry(name="metadata_storage_name", source="/document/metadata_storage_name"),
+                # Optionally provide file_data for small files (< 16MB)
+                # The function will use metadata_storage_path if file_data is not available
                 InputFieldMappingEntry(name="file_data", source="/document/file_data"),
-                InputFieldMappingEntry(name="file_name", source="/document/metadata_storage_name"),
                 InputFieldMappingEntry(name="content_type", source="/document/metadata_storage_content_type"),
             ],
             outputs=[
@@ -310,7 +313,9 @@ class CloudIngestionStrategy(Strategy):  # pragma: no cover
                     configuration=IndexingParametersConfiguration(
                         query_timeout=None,  # type: ignore
                         data_to_extract="storageMetadata",
-                        allow_skillset_to_read_file_data=True,
+                        # Set to False to prevent sending large files as inline data
+                        # The function will download from blob storage using metadata_storage_path instead
+                        allow_skillset_to_read_file_data=False,
                     )
                 ),
             )

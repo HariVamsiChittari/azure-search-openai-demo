@@ -8,13 +8,21 @@ import io
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote
 
 import azure.functions as func
 from azure.core.exceptions import HttpResponseError
 from azure.identity.aio import ManagedIdentityCredential
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.openai import OpenAIInstrumentor
+from azure.storage.blob.aio import BlobServiceClient
 
+from prepdocslib.blobmanager import BlobManager
 from prepdocslib.fileprocessor import FileProcessor
 from prepdocslib.page import Page
 from prepdocslib.servicesetup import (
@@ -31,6 +39,8 @@ logger = logging.getLogger(__name__)
 class GlobalSettings:
     file_processors: dict[str, FileProcessor]
     azure_credential: ManagedIdentityCredential
+    blob_service_client: BlobServiceClient | None
+    blob_manager: BlobManager | None
 
 
 settings: GlobalSettings | None = None
@@ -44,6 +54,8 @@ def configure_global_settings():
     use_local_html_parser = os.getenv("USE_LOCAL_HTML_PARSER", "false").lower() == "true"
     use_multimodal = os.getenv("USE_MULTIMODAL", "false").lower() == "true"
     document_intelligence_service = os.getenv("AZURE_DOCUMENTINTELLIGENCE_SERVICE")
+    storage_account = os.getenv("AZURE_STORAGE_ACCOUNT")
+    storage_container = os.getenv("AZURE_STORAGE_CONTAINER", "content")
 
     # Single shared managed identity credential
     if AZURE_CLIENT_ID := os.getenv("AZURE_CLIENT_ID"):
@@ -63,67 +75,38 @@ def configure_global_settings():
         process_figures=use_multimodal,
     )
 
+    # Create blob service client
+    blob_service_client = None
+    blob_manager = None
+    if storage_account:
+        blob_endpoint = f"https://{storage_account}.blob.core.windows.net"
+        blob_service_client = BlobServiceClient(account_url=blob_endpoint, credential=azure_credential)
+        logger.info("Initialized BlobServiceClient for %s", storage_account)
+        
+        # Initialize blob manager for uploading extracted images
+        blob_manager = BlobManager(
+            endpoint=blob_endpoint,
+            container=storage_container,
+            account=storage_account,
+            credential=azure_credential
+        )
+        logger.info("Initialized BlobManager for container %s", storage_container)
+
     settings = GlobalSettings(
         file_processors=file_processors,
         azure_credential=azure_credential,
+        blob_service_client=blob_service_client,
+        blob_manager=blob_manager,
     )
 
 
 @app.function_name(name="extract")
 @app.route(route="extract", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Azure Search Custom Skill: Extract document content
-
-    Input format (single record; file data only):
-    # https://learn.microsoft.com/azure/search/cognitive-search-skill-document-intelligence-layout#skill-inputs
-    {
-        "values": [
-            {
-                "recordId": "1",
-                "data": {
-                    // Base64 encoded file (skillset must enable file data)
-                    "file_data": {
-                        "$type": "file",
-                        "data": "base64..."
-                    },
-                    // Optional
-                    "file_name": "doc.pdf"
-                }
-            }
-        ]
-    }
-
-    Output format (snake_case only):
-    {
-        "values": [
-            {
-                "recordId": "1",
-                "data": {
-                    "pages": [
-                        {"page_num": 0, "text": "Page 1 text", "figure_ids": ["fig1"]},
-                        {"page_num": 1, "text": "Page 2 text", "figure_ids": []}
-                    ],
-                    "figures": [
-                        {
-                            "figure_id": "fig1",
-                            "page_num": 0,
-                            "document_file_name": "doc.pdf",
-                            "filename": "fig1.png",
-                            "mime_type": "image/png",
-                            "bytes_base64": "...",
-                            "bbox": [100,150,300,400],
-                            "title": "Figure Title",
-                            "placeholder": "<figure id=\"fig1\"></figure>"
-                        }
-                    ]
-                },
-                "errors": [],
-                "warnings": []
-            }
-        ]
-    }
-    """
+    """Azure Search Custom Skill: Extract document content (supports multiple batches)"""
+    batch_start_time = time.time()
+    batch_id = f"batch_{int(batch_start_time)}"
+    
     if settings is None:
         return func.HttpResponse(
             json.dumps({"error": "Settings not initialized"}),
@@ -135,54 +118,166 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
         # Parse custom skill input
         req_body = req.get_json()
         input_values = req_body.get("values", [])
+        batch_size = len(input_values)
+        
+        if batch_size == 0:
+            raise ValueError("No input records provided")
 
-        if len(input_values) != 1:
-            raise ValueError("document_extractor expects exactly one record per request, set batchSize to 1.")
+        logger.info(
+            "[METRICS] function=document_extractor | operation=batch_start | batch_id=%s | batch_size=%d",
+            batch_id, batch_size
+        )
 
-        input_record = input_values[0]
-        record_id = input_record.get("recordId", "")
-        data = input_record.get("data", {})
+        output_values = []
+        batch_stats = {
+            "total_files": 0,
+            "successful_files": 0,
+            "failed_files": 0,
+            "total_pages": 0,
+            "total_figures": 0,
+            "total_size_mb": 0.0,
+            "processing_times": []
+        }
 
-        try:
-            result = await process_document(data)
-            output_values = [
-                {
+        # Process each record in the batch
+        for idx, input_record in enumerate(input_values):
+            record_start_time = time.time()
+            record_id = input_record.get("recordId", f"record_{idx}")
+            data = input_record.get("data", {})
+
+            # Extract file name for metrics
+            file_name = (
+                data.get("metadata_storage_name") or 
+                data.get("file_name") or 
+                data.get("fileName") or
+                f"unknown_file_{idx}"
+            )
+            
+            batch_stats["total_files"] += 1
+            
+            logger.info(
+                "[METRICS] function=document_extractor | operation=record_start | batch_id=%s | record_idx=%d | "
+                "file=%s | recordId=%s",
+                batch_id, idx, file_name, record_id
+            )
+
+            try:
+                process_start = time.time()
+                result, file_size_mb = await process_document(data)
+                process_duration = time.time() - process_start
+                
+                num_pages = len(result.get("pages", []))
+                num_figures = len(result.get("figures", []))
+                
+                # Update batch statistics
+                batch_stats["successful_files"] += 1
+                batch_stats["total_pages"] += num_pages
+                batch_stats["total_figures"] += num_figures
+                batch_stats["total_size_mb"] += file_size_mb
+                batch_stats["processing_times"].append(process_duration)
+                
+                logger.info(
+                    "[METRICS] function=document_extractor | operation=record_success | batch_id=%s | record_idx=%d | "
+                    "file=%s | duration_sec=%.2f | pages=%d | figures=%d | size_mb=%.2f",
+                    batch_id, idx, file_name, process_duration, num_pages, num_figures, file_size_mb
+                )
+                
+                output_values.append({
                     "recordId": record_id,
                     "data": result,
                     "errors": [],
                     "warnings": [],
-                }
-            ]
-        except Exception as e:
-            logger.error("Error processing record %s: %s", record_id, str(e), exc_info=True)
-            output_values = [
-                {
+                })
+                
+            except Exception as e:
+                process_duration = time.time() - record_start_time
+                batch_stats["failed_files"] += 1
+                batch_stats["processing_times"].append(process_duration)
+                error_type = type(e).__name__
+                
+                logger.error(
+                    "[METRICS] function=document_extractor | operation=record_error | batch_id=%s | record_idx=%d | "
+                    "file=%s | duration_sec=%.2f | error_type=%s | error_message=%s",
+                    batch_id, idx, file_name, process_duration, error_type, str(e), exc_info=True
+                )
+                
+                output_values.append({
                     "recordId": record_id,
                     "data": {},
                     "errors": [{"message": str(e)}],
                     "warnings": [],
-                }
-            ]
+                })
 
+        # Log batch completion metrics
+        batch_duration = time.time() - batch_start_time
+        avg_processing_time = sum(batch_stats["processing_times"]) / max(len(batch_stats["processing_times"]), 1)
+        success_rate = (batch_stats["successful_files"] / batch_stats["total_files"]) * 100
+        total_throughput_mbps = batch_stats["total_size_mb"] / max(batch_duration, 0.001)
+        
+        logger.info(
+            "[METRICS] function=document_extractor | operation=batch_complete | batch_id=%s | "
+            "batch_size=%d | successful=%d | failed=%d | success_rate=%.1f%% | "
+            "total_duration_sec=%.2f | avg_processing_sec=%.2f | total_pages=%d | total_figures=%d | "
+            "total_size_mb=%.2f | throughput_mbps=%.2f",
+            batch_id, batch_stats["total_files"], batch_stats["successful_files"], batch_stats["failed_files"],
+            success_rate, batch_duration, avg_processing_time, batch_stats["total_pages"], 
+            batch_stats["total_figures"], batch_stats["total_size_mb"], total_throughput_mbps
+        )
+        
         return func.HttpResponse(json.dumps({"values": output_values}), mimetype="application/json", status_code=200)
 
     except Exception as e:
-        logger.error("Fatal error in extract_document: %s", str(e), exc_info=True)
+        batch_duration = time.time() - batch_start_time
+        error_type = type(e).__name__
+        
+        logger.error(
+            "[METRICS] function=document_extractor | operation=batch_fatal_error | batch_id=%s | "
+            "duration_sec=%.2f | error_type=%s | error_message=%s",
+            batch_id, batch_duration, error_type, str(e), exc_info=True
+        )
+        
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
 
 
-async def process_document(data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Process a single document: download, parse, extract figures, upload images
+async def process_document(data: dict[str, Any]) -> tuple[dict[str, Any], float]:
+    """Process a single document: download, parse, extract figures, upload images"""
+    file_name = "unknown"
+    download_start = time.time()
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=input_analysis | available_fields=%s",
+        ", ".join(data.keys()) if data else "none"
+    )
+    
 
-    Args:
-        data: Input data with blobUrl, fileName, contentType
-
-    Returns:
-        Dictionary with 'text' (markdown) and 'images' (list of {url, description})
-    """
-    document_stream, file_name, content_type = get_document_stream_filedata(data)
-    logger.info("Processing document: %s", file_name)
+    if "metadata_storage_path" in data:
+        document_stream, file_name, content_type = await get_document_stream_from_blob_url(data, "metadata_storage_path")
+    elif "normalized_images" in data and "metadata_storage_path" in data.get("normalized_images", {}):
+        # Handle Azure Search normalized_images format
+        document_stream, file_name, content_type = await get_document_stream_from_blob_url(data["normalized_images"], "metadata_storage_path")
+    elif any(key.endswith("_path") for key in data.keys()):
+        # Try to find any field ending with _path that might contain blob URL
+        path_key = next((k for k in data.keys() if k.endswith("_path")), None)
+        logger.info("Found alternative path field: %s", path_key)
+        document_stream, file_name, content_type = await get_document_stream_from_blob_url(data, path_key)
+    else:
+        # Provide detailed error message with available fields
+        available_fields = ", ".join(data.keys()) if data else "none"
+        raise ValueError(
+            f"Input must contain either 'file_data' with base64 data or 'metadata_storage_path' with blob URL. "
+            f"For files larger than 16MB, the indexer cannot send file_data inline. "
+            f"Available fields in input: {available_fields}. "
+            f"Update your skillset to pass 'metadata_storage_path' or configure file data enrichment."
+        )
+    
+    download_duration = time.time() - download_start
+    file_size_mb = len(document_stream.getvalue()) / (1024 * 1024)
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=download | file=%s | "
+        "size_mb=%.2f | duration_sec=%.2f | throughput_mbps=%.2f",
+        file_name, file_size_mb, download_duration, file_size_mb / max(download_duration, 0.001)
+    )
 
     # Get parser from file_processors dict based on file extension
     file_processor = select_processor_for_filename(file_name, settings.file_processors)
@@ -191,41 +286,152 @@ async def process_document(data: dict[str, Any]) -> dict[str, Any]:
     pages: list[Page] = []
     try:
         document_stream.seek(0)
-        pages = [page async for page in parser.parse(content=document_stream)]
+        page_count = 0
+        async for page in parser.parse(content=document_stream):
+            pages.append(page)
+            page_count += 1
+            if page_count % 50 == 0:
+                logger.info("Processed %d pages...", page_count)
     except HttpResponseError as exc:
         raise ValueError(f"Parser failed for {file_name}: {exc.message}") from exc
+    except Exception as exc:
+        logger.error("Parse error after %d pages: %s", len(pages), str(exc), exc_info=True)
+        raise ValueError(f"Parser failed for {file_name}: {str(exc)}") from exc
     finally:
         document_stream.close()
 
-    components = build_document_components(file_name, pages)
-    return components
+    logger.info("Successfully parsed %d pages from %s", len(pages), file_name)
+    
+    parse_duration = time.time() - download_start
+    avg_per_page = parse_duration / max(len(pages), 1)
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=parse_complete | file=%s | "
+        "pages=%d | duration_sec=%.2f | avg_per_page_sec=%.2f | size_mb=%.2f",
+        file_name, len(pages), parse_duration, avg_per_page, file_size_mb
+    )
+    
+    upload_images = settings.blob_manager is not None
+    build_start = time.time()
+    components = await build_document_components(file_name, pages, upload_images)
+    build_duration = time.time() - build_start
+    
+    num_figures = len(components.get("figures", []))
+    logger.info(
+        "[METRICS] function=document_extractor | operation=build_components | file=%s | "
+        "duration_sec=%.2f | figures=%d | size_mb=%.2f",
+        file_name, build_duration, num_figures, file_size_mb
+    )
+    
+    return components, file_size_mb
 
 
-def get_document_stream_filedata(data: dict[str, Any]) -> tuple[io.BytesIO, str, str]:
-    """Return a BytesIO stream for file_data input only (skillset must send file bytes)."""
-    file_payload = data.get("file_data", {})
-    encoded = file_payload.get("data")
-    if not encoded:
-        raise ValueError("file_data payload missing base64 data")
-    document_bytes = base64.b64decode(encoded)
-    file_name = data.get("file_name") or data.get("fileName") or file_payload.get("name") or "document"
-    content_type = data.get("contentType") or file_payload.get("contentType") or "application/octet-stream"
-    stream = io.BytesIO(document_bytes)
-    stream.name = file_name
-    return stream, file_name, content_type
+async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str = "metadata_storage_path") -> tuple[io.BytesIO, str, str]:
+    """Download document from blob storage using metadata_storage_path or other URL field."""
+    if settings.blob_service_client is None:
+        raise ValueError("Blob storage not configured. Set AZURE_STORAGE_ACCOUNT environment variable.")
+    
+    blob_url = data.get(url_field)
+    if not blob_url:
+        raise ValueError(f"{url_field} not found in input data")
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=blob_download_start | url_field=%s | blob_url=%s",
+        url_field, blob_url
+    )
+    
+    # Parse blob URL: https://account.blob.core.windows.net/container/path/file.pdf
+    # Handle both full URLs and SAS URLs
+    url_parts = blob_url.split("?")[0].split("/")  # Remove SAS token if present
+    
+    if len(url_parts) < 5:
+        raise ValueError(f"Invalid blob URL format: {blob_url}")
+    
+    container_name = url_parts[3]
+    # URL decode the blob name to handle spaces and special characters
+    blob_name_encoded = "/".join(url_parts[4:])
+    blob_name = unquote(blob_name_encoded)
+    
+    logger.info(
+        "[METRICS] function=document_extractor | operation=blob_parse | container=%s | blob=%s | encoded_blob=%s",
+        container_name, blob_name, blob_name_encoded
+    )
+    
+    # Try multiple possible name fields
+    file_name = (
+        data.get("metadata_storage_name") or 
+        data.get("file_name") or 
+        data.get("fileName") or 
+        blob_name.split("/")[-1]
+    )
+    
+    logger.info("Downloading from blob: container='%s', blob='%s' (decoded from '%s')", container_name, blob_name, blob_name_encoded)
+    
+    blob_client = settings.blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+    
+    try:
+        download_stream = await blob_client.download_blob()
+        blob_bytes = await download_stream.readall()
+        logger.info(
+            "[METRICS] function=document_extractor | operation=blob_download_complete | file=%s | size_bytes=%d",
+            file_name, len(blob_bytes)
+        )
+        
+        stream = io.BytesIO(blob_bytes)
+        stream.name = file_name
+        return stream, file_name, "application/pdf"
+    except Exception as e:
+        logger.error(
+            "[METRICS] function=document_extractor | operation=blob_download_failed | container=%s | blob=%s | error=%s",
+            container_name, blob_name, str(e), exc_info=True
+        )
+        raise ValueError(f"Failed to download from blob storage: {str(e)}") from e
 
 
-def build_document_components(file_name: str, pages: list[Page]) -> dict[str, Any]:
+
+
+async def build_document_components(file_name: str, pages: list[Page], upload_images: bool = False) -> dict[str, Any]:
+    """Build document components with optional image upload to blob storage."""
     page_entries: list[dict[str, Any]] = []
     figure_entries: list[dict[str, Any]] = []
 
     for page in pages:
         page_text = page.text or ""
         figure_ids_on_page: list[str] = []
+        
         if page.images:
             for image in page.images:
                 figure_ids_on_page.append(image.figure_id)
-                figure_entries.append(image.to_skill_payload(file_name))
+                
+                # Upload image to blob storage if enabled
+                if upload_images and settings.blob_manager:
+                    try:
+                        # Upload the image bytes to blob storage
+                        blob_path = f"images/{file_name}/{image.figure_id}.png"
+                        await settings.blob_manager.upload_blob(
+                            blob_path,
+                            image.get_image_bytes()
+                        )
+                        # Add URL to the figure entry instead of base64
+                        figure_payload = image.to_skill_payload(file_name)
+                        figure_payload["url"] = f"{settings.blob_manager.endpoint}/{settings.blob_manager.container}/{blob_path}"
+                        # Remove base64 data to reduce response size
+                        figure_payload.pop("bytes_base64", None)
+                        figure_entries.append(figure_payload)
+                        logger.info(
+                            "[METRICS] function=document_extractor | operation=image_upload_success | file=%s | figure_id=%s",
+                            file_name, image.figure_id
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[METRICS] function=document_extractor | operation=image_upload_failed | file=%s | figure_id=%s | error=%s",
+                            file_name, image.figure_id, str(e)
+                        )
+                        # Fall back to base64 if upload fails
+                        figure_entries.append(image.to_skill_payload(file_name))
+                else:
+                    # Return base64 encoded image inline
+                    figure_entries.append(image.to_skill_payload(file_name))
 
         page_entries.append(
             {
@@ -242,8 +448,33 @@ def build_document_components(file_name: str, pages: list[Page]) -> dict[str, An
     }
 
 
-# Initialize settings at module load time, unless we're in a test environment
+# Initialize settings and configure monitoring
 if os.environ.get("PYTEST_CURRENT_TEST") is None:
+    # Configure Azure Monitor telemetry
+    if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
+        logger.info("APPLICATIONINSIGHTS_CONNECTION_STRING is set, enabling Azure Monitor")
+        configure_azure_monitor(
+            instrumentation_options={
+                "django": {"enabled": False},
+                "psycopg2": {"enabled": False},
+                "fastapi": {"enabled": False},
+            }
+        )
+        # This tracks HTTP requests made by aiohttp:
+        AioHttpClientInstrumentor().instrument()
+        # This tracks HTTP requests made by httpx:
+        HTTPXClientInstrumentor().instrument()
+        # This tracks OpenAI SDK requests:
+        OpenAIInstrumentor().instrument()
+
+    # Log levels should be one of https://docs.python.org/3/library/logging.html#logging-levels
+    # Set root level to WARNING to avoid seeing overly verbose logs from SDKS
+    logging.basicConfig(level=logging.WARNING)
+    # Set our own logger levels to INFO by default
+    app_level = os.getenv("APP_LOG_LEVEL", "INFO")
+    logger.setLevel(app_level)
+    logging.getLogger("scripts").setLevel(app_level)
+
     try:
         configure_global_settings()
     except KeyError as e:

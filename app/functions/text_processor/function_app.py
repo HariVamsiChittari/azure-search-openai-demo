@@ -6,11 +6,16 @@ import io
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import azure.functions as func
 from azure.identity.aio import ManagedIdentityCredential
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.openai import OpenAIInstrumentor
 
 from prepdocslib.blobmanager import BlobManager
 from prepdocslib.embeddings import OpenAIEmbeddings
@@ -115,8 +120,10 @@ def configure_global_settings():
 @app.route(route="process", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 async def process_text_entry(req: func.HttpRequest) -> func.HttpResponse:
     """Azure Search custom skill entry point for chunking and embeddings."""
-
+    start_time = time.time()
+    
     if settings is None:
+        logger.error("[METRICS] function=text_processor | operation=error | error_type=initialization_error")
         return func.HttpResponse(
             json.dumps({"error": "Settings not initialized"}),
             mimetype="application/json",
@@ -126,7 +133,7 @@ async def process_text_entry(req: func.HttpRequest) -> func.HttpResponse:
     try:
         payload = req.get_json()
     except ValueError as exc:
-        logger.error("Invalid JSON payload: %s", exc)
+        logger.error("[METRICS] function=text_processor | operation=error | error_type=invalid_json | error=%s", exc)
         return func.HttpResponse(
             json.dumps({"error": "Request body must be valid JSON"}),
             mimetype="application/json",
@@ -134,13 +141,36 @@ async def process_text_entry(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     values = payload.get("values", [])
+    total_records = len(values)
+    successful_records = 0
+    failed_records = 0
+    total_chunks = 0
+    
+    logger.info(
+        "[METRICS] function=text_processor | operation=batch_start | record_count=%d | use_vectors=%s | use_multimodal=%s",
+        total_records, settings.use_vectors, settings.use_multimodal
+    )
+    
     output_values: list[dict[str, Any]] = []
 
     for record in values:
         record_id = record.get("recordId", "")
         data = record.get("data", {})
+        record_start_time = time.time()
+        
         try:
             chunks = await process_document(data)
+            record_duration = time.time() - record_start_time
+            chunk_count = len(chunks)
+            total_chunks += chunk_count
+            successful_records += 1
+            
+            logger.info(
+                "[METRICS] function=text_processor | operation=record_complete | record_id=%s | "
+                "chunk_count=%d | duration_sec=%.2f | status=success",
+                record_id, chunk_count, record_duration
+            )
+            
             output_values.append(
                 {
                     "recordId": record_id,
@@ -150,7 +180,15 @@ async def process_text_entry(req: func.HttpRequest) -> func.HttpResponse:
                 }
             )
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Failed to process record %s: %s", record_id, exc, exc_info=True)
+            record_duration = time.time() - record_start_time
+            failed_records += 1
+            
+            logger.error(
+                "[METRICS] function=text_processor | operation=record_complete | record_id=%s | "
+                "error_type=%s | error_message=%s | duration_sec=%.2f | status=failed",
+                record_id, type(exc).__name__, str(exc), record_duration, exc_info=True
+            )
+            
             output_values.append(
                 {
                     "recordId": record_id,
@@ -159,6 +197,15 @@ async def process_text_entry(req: func.HttpRequest) -> func.HttpResponse:
                     "warnings": [],
                 }
             )
+
+    total_duration = time.time() - start_time
+    success_rate = (successful_records / total_records * 100) if total_records > 0 else 0
+    
+    logger.info(
+        "[METRICS] function=text_processor | operation=batch_complete | total_records=%d | "
+        "successful_records=%d | failed_records=%d | total_chunks=%d | duration_sec=%.2f | success_rate=%.1f",
+        total_records, successful_records, failed_records, total_chunks, total_duration, success_rate
+    )
 
     return func.HttpResponse(
         json.dumps({"values": output_values}),
@@ -191,7 +238,11 @@ async def process_document(data: dict[str, Any]) -> list[dict[str, Any]]:
 
     figures_by_id = {figure["figure_id"]: figure for figure in figures_input}
 
-    logger.info("Processing %s: %d pages, %d figures", file_name, len(pages_input), len(figures_input))
+    logger.info(
+        "[METRICS] function=text_processor | operation=document_start | file=%s | "
+        "page_count=%d | figure_count=%d",
+        file_name, len(pages_input), len(figures_input)
+    )
 
     # Build Page objects with placeholders intact (figure markup will be injected by combine_text_with_figures())
     pages: list[Page] = []
@@ -218,7 +269,11 @@ async def process_document(data: dict[str, Any]) -> list[dict[str, Any]]:
         pages.append(page_obj)
 
     if not pages:
-        logger.info("No textual content found for %s", file_name)
+        logger.info(
+            "[METRICS] function=text_processor | operation=document_complete | file=%s | "
+            "output_chunks=0 | reason=no_pages",
+            file_name
+        )
         return []
 
     # Create a lightweight File wrapper required by process_text
@@ -232,6 +287,11 @@ async def process_document(data: dict[str, Any]) -> list[dict[str, Any]]:
 
     sections = process_text(pages, file_wrapper, splitter, category=None)
     if not sections:
+        logger.info(
+            "[METRICS] function=text_processor | operation=document_complete | file=%s | "
+            "output_chunks=0 | reason=no_sections",
+            file_name
+        )
         return []
 
     # Generate embeddings for section texts
@@ -239,13 +299,26 @@ async def process_document(data: dict[str, Any]) -> list[dict[str, Any]]:
     embeddings: list[list[float]] | None = None
     if settings.use_vectors and chunk_texts:
         if settings.embedding_service:
+            embedding_start_time = time.time()
             embeddings = await settings.embedding_service.create_embeddings(chunk_texts)
+            embedding_duration = time.time() - embedding_start_time
+            
+            logger.info(
+                "[METRICS] function=text_processor | operation=embeddings_complete | file=%s | "
+                "embedding_count=%d | duration_sec=%.2f",
+                file_name, len(embeddings) if embeddings else 0, embedding_duration
+            )
         else:
-            logger.warning("Embeddings requested but service not initialised; skipping vectors")
+            logger.warning(
+                "[METRICS] function=text_processor | operation=embeddings_skipped | file=%s | reason=service_not_initialized",
+                file_name
+            )
 
     # Use the same id base generation as local ingestion pipeline for parity
     normalized_id = file_wrapper.filename_to_id()
     outputs: list[dict[str, Any]] = []
+    skipped_embeddings = 0
+    
     for idx, section in enumerate(sections):
         content = section.chunk.text.strip()
         if not content:
@@ -274,23 +347,59 @@ async def process_document(data: dict[str, Any]) -> list[dict[str, Any]]:
             if len(embedding_vec) == settings.embedding_dimensions:
                 chunk_entry["embedding"] = embedding_vec
             else:
+                skipped_embeddings += 1
                 logger.warning(
-                    "Skipping embedding for %s chunk %d due to dimension mismatch (expected %d, got %d)",
-                    file_name,
-                    idx,
-                    settings.embedding_dimensions,
-                    len(embedding_vec),
+                    "[METRICS] function=text_processor | operation=embedding_dimension_mismatch | file=%s | "
+                    "chunk_index=%d | expected_dimensions=%d | actual_dimensions=%d",
+                    file_name, idx, settings.embedding_dimensions, len(embedding_vec)
                 )
         elif settings.use_vectors:
-            logger.warning("Embeddings were requested but missing for %s chunk %d", file_name, idx)
+            skipped_embeddings += 1
+            logger.warning(
+                "[METRICS] function=text_processor | operation=embedding_missing | file=%s | chunk_index=%d",
+                file_name, idx
+            )
 
         outputs.append(chunk_entry)
+
+    image_ref_count = sum(len(chunk.get("images", [])) for chunk in outputs)
+    
+    logger.info(
+        "[METRICS] function=text_processor | operation=document_complete | file=%s | "
+        "total_sections=%d | output_chunks=%d | image_references=%d | skipped_embeddings=%d",
+        file_name, len(sections), len(outputs), image_ref_count, skipped_embeddings
+    )
 
     return outputs
 
 
-# Initialize settings at module load time, unless we're in a test environment
+# Initialize settings and configure monitoring
 if os.environ.get("PYTEST_CURRENT_TEST") is None:
+    # Configure Azure Monitor telemetry
+    if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
+        logger.info("APPLICATIONINSIGHTS_CONNECTION_STRING is set, enabling Azure Monitor")
+        configure_azure_monitor(
+            instrumentation_options={
+                "django": {"enabled": False},
+                "psycopg2": {"enabled": False},
+                "fastapi": {"enabled": False},
+            }
+        )
+        # This tracks HTTP requests made by aiohttp:
+        AioHttpClientInstrumentor().instrument()
+        # This tracks HTTP requests made by httpx:
+        HTTPXClientInstrumentor().instrument()
+        # This tracks OpenAI SDK requests:
+        OpenAIInstrumentor().instrument()
+
+    # Log levels should be one of https://docs.python.org/3/library/logging.html#logging-levels
+    # Set root level to WARNING to avoid seeing overly verbose logs from SDKS
+    logging.basicConfig(level=logging.WARNING)
+    # Set our own logger levels to INFO by default
+    app_level = os.getenv("APP_LOG_LEVEL", "INFO")
+    logger.setLevel(app_level)
+    logging.getLogger("scripts").setLevel(app_level)
+
     try:
         configure_global_settings()
     except KeyError as e:

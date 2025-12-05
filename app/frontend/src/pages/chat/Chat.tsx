@@ -7,7 +7,17 @@ import readNDJSONStream from "ndjson-readablestream";
 import appLogo from "../../assets/applogo.svg";
 import styles from "./Chat.module.css";
 
-import { chatApi, configApi, RetrievalMode, ChatAppResponse, ChatAppResponseOrError, ChatAppRequest, ResponseMessage, SpeechConfig } from "../../api";
+import {
+    chatApi,
+    configApi,
+    RetrievalMode,
+    ChatAppResponse,
+    ChatAppResponseOrError,
+    ChatAppRequest,
+    ResponseMessage,
+    SpeechConfig,
+    SessionState
+} from "../../api";
 import { Answer, AnswerError, AnswerLoading } from "../../components/Answer";
 import { QuestionInput } from "../../components/QuestionInput";
 import { ExampleList } from "../../components/Example";
@@ -25,6 +35,29 @@ import { TokenClaimsDisplay } from "../../components/TokenClaimsDisplay";
 import { LoginContext } from "../../loginContext";
 import { LanguagePicker } from "../../i18n/LanguagePicker";
 import { Settings } from "../../components/Settings/Settings";
+
+const normalizeSessionStateForRequest = (state: SessionState | null): SessionState | null => {
+    if (state === null || typeof state === "string") {
+        return state;
+    }
+    if (Object.keys(state).length === 0) {
+        return null;
+    }
+    return state;
+};
+
+const getHistoryId = (state: SessionState | null): string | null => {
+    if (!state) {
+        return null;
+    }
+    if (typeof state === "string") {
+        return state;
+    }
+    if (typeof state.id === "string" && state.id.length > 0) {
+        return state.id;
+    }
+    return null;
+};
 
 const Chat = () => {
     const [isConfigPanelOpen, setIsConfigPanelOpen] = useState(false);
@@ -274,7 +307,7 @@ const Chat = () => {
                     }
                 },
                 // AI Chat Protocol: Client must pass on any session state received from the server
-                session_state: answers.length ? answers[answers.length - 1][1].session_state : null
+                session_state: normalizeSessionStateForRequest(answers.length ? answers[answers.length - 1][1].session_state : null)
             };
 
             const response = await chatApi(request, shouldStream, token);
@@ -287,9 +320,10 @@ const Chat = () => {
             if (shouldStream) {
                 const parsedResponse: ChatAppResponse = await handleAsyncRequest(question, answers, response.body);
                 setAnswers([...answers, [question, parsedResponse]]);
-                if (typeof parsedResponse.session_state === "string" && parsedResponse.session_state !== "") {
+                const sessionStateForHistory = getHistoryId(parsedResponse.session_state);
+                if (sessionStateForHistory) {
                     const token = client ? await getToken(client) : undefined;
-                    historyManager.addItem(parsedResponse.session_state, [...answers, [question, parsedResponse]], token);
+                    historyManager.addItem(sessionStateForHistory, [...answers, [question, parsedResponse]], token);
                 }
             } else {
                 const parsedResponse: ChatAppResponseOrError = await response.json();
@@ -297,9 +331,10 @@ const Chat = () => {
                     throw Error(parsedResponse.error);
                 }
                 setAnswers([...answers, [question, parsedResponse as ChatAppResponse]]);
-                if (typeof parsedResponse.session_state === "string" && parsedResponse.session_state !== "") {
+                const sessionStateForHistory = getHistoryId(parsedResponse.session_state);
+                if (sessionStateForHistory) {
                     const token = client ? await getToken(client) : undefined;
-                    historyManager.addItem(parsedResponse.session_state, [...answers, [question, parsedResponse as ChatAppResponse]], token);
+                    historyManager.addItem(sessionStateForHistory, [...answers, [question, parsedResponse as ChatAppResponse]], token);
                 }
             }
             setSpeechUrls([...speechUrls, null]);

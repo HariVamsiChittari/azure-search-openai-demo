@@ -83,11 +83,13 @@ export type ResponseContext = {
     answer?: string;
 };
 
+export type SessionState = string | Record<string, any> | null;
+
 export type ChatAppResponseOrError = {
     message: ResponseMessage;
     delta: ResponseMessage;
     context: ResponseContext;
-    session_state: any;
+    session_state: SessionState;
     error?: string;
 };
 
@@ -95,7 +97,7 @@ export type ChatAppResponse = {
     message: ResponseMessage;
     delta: ResponseMessage;
     context: ResponseContext;
-    session_state: any;
+    session_state: SessionState;
 };
 
 export type ChatAppRequestContext = {
@@ -105,7 +107,7 @@ export type ChatAppRequestContext = {
 export type ChatAppRequest = {
     messages: ResponseMessage[];
     context?: ChatAppRequestContext;
-    session_state: any;
+    session_state: SessionState;
 };
 
 export type Config = {

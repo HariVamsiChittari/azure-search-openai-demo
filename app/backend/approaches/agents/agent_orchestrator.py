@@ -22,9 +22,10 @@ Agent Factory Pattern:
 
 import logging
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, MutableMapping
 from typing import Any, Optional, Union
 
+from agent_framework import AgentThread
 from agent_framework.azure import AzureOpenAIChatClient
 from azure.search.documents.aio import SearchClient
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -130,15 +131,6 @@ class AgentOrchestrator(Approach):
         # Initialize Context Holders and Tool Classes (using @ai_function pattern)
         # ----------------------------------------------------------------------------------
 
-        # Store current context for sub-agents
-        self._current_session_state = None
-        self._current_context: dict[str, Any] = {}
-        # Track thoughts during agent execution (populated during run)
-        self._current_thoughts: list[ThoughtStep] = []
-        # Store context needed by search_knowledge_base tool to call run_search_approach
-        self._current_messages: list[ChatCompletionMessageParam] = []
-        self._current_overrides: dict[str, Any] = {}
-        self._current_auth_claims: dict[str, Any] = {}
         # Store data_points from search tool for inclusion in final response
         self._current_data_points: DataPoints = DataPoints(text=[], images=[], citations=[])
 
@@ -330,10 +322,6 @@ class AgentOrchestrator(Approach):
             thoughts=thoughts,
         )
 
-        # Initialize the current thoughts list for sub-agent tracking
-        # Sub-agents will append their ThoughtSteps to this list during execution
-        self._current_thoughts = thoughts
-
         # Update tool contexts with current request information
         self._update_tool_contexts(
             messages=messages,
@@ -344,6 +332,27 @@ class AgentOrchestrator(Approach):
         )
 
         return (extra_info, user_query)
+
+    async def _get_thread_from_session_state(self, session_state: dict[str, Any]) -> AgentThread:
+        """Return a hydrated supervisor thread for the current session."""
+
+        thread_state = get_supervisor_thread_state(session_state)
+        if thread_state:
+            try:
+                return await self.supervisor_agent.deserialize_thread(thread_state)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Failed to deserialize supervisor thread; starting fresh.", exc_info=exc)
+        return self.supervisor_agent.get_new_thread()
+
+    async def _persist_thread_state(self, session_state: dict[str, Any], thread: AgentThread) -> dict[str, Any]:
+        """Serialize the supervisor thread and store it in the session envelope."""
+
+        try:
+            serialized_thread = await thread.serialize()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to serialize supervisor thread state.", exc_info=exc)
+            return session_state
+        return store_supervisor_thread_state(session_state, serialized_thread)
 
     async def run_without_streaming(
         self,
@@ -366,13 +375,16 @@ class AgentOrchestrator(Approach):
             Response dictionary with the answer from SupervisorAgent
         """
         # Get orchestration context and user query using run_until_final_call
+        normalized_session_state = normalize_session_state(session_state)
+        thread = await self._get_thread_from_session_state(normalized_session_state)
+
         extra_info, user_query = await self.run_until_final_call(messages, overrides, auth_claims, should_stream=False)
 
         logger.info(f"SupervisorAgent: Processing query: {user_query[:100]}...")
 
         # Run the supervisor agent - non-streaming
         # This gets the complete result at once, following agent-framework pattern
-        result_response = await self.supervisor_agent.run(user_query)
+        result_response = await self.supervisor_agent.run(user_query, thread=thread)
 
         logger.info("SupervisorAgent: Successfully processed query through agent hierarchy")
 
@@ -400,6 +412,8 @@ class AgentOrchestrator(Approach):
         logger.info(f"SupervisorAgent: Final data_points.citations: {extra_info.data_points.citations}")
         logger.info(f"SupervisorAgent: Final data_points.text count: {len(extra_info.data_points.text or [])}")
 
+        updated_session_state = await self._persist_thread_state(normalized_session_state, thread)
+
         # Format response to match expected Approach interface
         chat_app_response = {
             "message": {"content": content, "role": role},
@@ -412,7 +426,7 @@ class AgentOrchestrator(Approach):
                 },
                 "followup_questions": extra_info.followup_questions,
             },
-            "session_state": session_state,
+            "session_state": updated_session_state,
         }
 
         return chat_app_response
@@ -438,12 +452,15 @@ class AgentOrchestrator(Approach):
             Response chunks with streaming content
         """
         # Get orchestration context and user query using run_until_final_call
+        normalized_session_state = normalize_session_state(session_state)
+        thread = await self._get_thread_from_session_state(normalized_session_state)
+
         extra_info, user_query = await self.run_until_final_call(messages, overrides, auth_claims, should_stream=True)
 
         logger.info(f"SupervisorAgent (streaming): Processing query: {user_query[:100]}...")
 
         # Yield initial context with role and thoughts
-        yield {"delta": {"role": "assistant"}, "context": extra_info, "session_state": session_state}
+        yield {"delta": {"role": "assistant"}, "context": extra_info, "session_state": normalized_session_state}
 
         # Track content for follow-up questions (matching chatreadretrieveread.py pattern)
         followup_questions_started = False
@@ -452,7 +469,7 @@ class AgentOrchestrator(Approach):
 
         # Stream results as they are generated using agent.run_stream()
         # Following agent-framework streaming pattern
-        async for chunk in self.supervisor_agent.run_stream(user_query):
+        async for chunk in self.supervisor_agent.run_stream(user_query, thread=thread):
             if chunk.text:
                 content = chunk.text
                 full_content += content
@@ -499,7 +516,9 @@ class AgentOrchestrator(Approach):
 
         # Yield final context with ALL thoughts (including sub-agent ThoughtSteps appended during streaming)
         # This ensures the UI receives the complete thought process after tool calls complete
-        yield {"delta": {"role": "assistant"}, "context": extra_info, "session_state": session_state}
+        updated_session_state = await self._persist_thread_state(normalized_session_state, thread)
+
+        yield {"delta": {"role": "assistant"}, "context": extra_info, "session_state": updated_session_state}
 
         logger.info("SupervisorAgent (streaming): Successfully completed streaming response")
 
@@ -523,17 +542,10 @@ class AgentOrchestrator(Approach):
         """
         overrides = context.get("overrides", {})
         auth_claims = context.get("auth_claims", {})
+        normalized_session_state = normalize_session_state(session_state)
 
         try:
-            # Store context for potential use by sub-agents and search tool
-            self._current_session_state = session_state
-            self._current_context = context
-            # Store context needed by search_knowledge_base to call run_search_approach
-            self._current_messages = messages
-            self._current_overrides = overrides
-            self._current_auth_claims = auth_claims
-
-            result = await self.run_without_streaming(messages, overrides, auth_claims, session_state)
+            result = await self.run_without_streaming(messages, overrides, auth_claims, normalized_session_state)
             return result
 
         except Exception as e:
@@ -562,16 +574,13 @@ class AgentOrchestrator(Approach):
         """
         overrides = context.get("overrides", {})
         auth_claims = context.get("auth_claims", {})
-
-        # Store context for potential use by sub-agents and search tool
-        self._current_session_state = session_state
-        self._current_context = context
-        # Store context needed by search_knowledge_base to call run_search_approach
-        self._current_messages = messages
-        self._current_overrides = overrides
-        self._current_auth_claims = auth_claims
-
-        return self.run_with_streaming(messages, overrides, auth_claims, session_state)
+        normalized_session_state = normalize_session_state(session_state)
+        try:
+            return self.run_with_streaming(messages, overrides, auth_claims, normalized_session_state)
+        except Exception as e:
+            logger.error(f"SupervisorAgent (streaming): Error occurred: {e}", exc_info=True)
+            logger.info("SupervisorAgent (streaming): Falling back to chat approach")
+            return self.chat_approach.run_stream(messages, normalized_session_state, context)
 
     def _extract_user_query(self, messages: list[ChatCompletionMessageParam]) -> str:
         """
@@ -593,3 +602,50 @@ class AgentOrchestrator(Approach):
                     text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
                     return " ".join(text_parts)
         return ""
+
+def normalize_session_state(session_state: Any) -> dict[str, Any]:
+    """Normalize incoming session state into a dict with an agent_framework section."""
+
+    normalized: dict[str, Any]
+    if isinstance(session_state, dict):
+        normalized = dict(session_state)
+    else:
+        normalized = {}
+        if session_state is not None:
+            normalized["id"] = session_state
+
+    agent_state = normalized.get("agent_framework")
+    if not isinstance(agent_state, dict):
+        agent_state = {}
+        normalized["agent_framework"] = agent_state
+
+    return normalized
+
+
+def get_supervisor_thread_state(session_state: dict[str, Any]) -> MutableMapping[str, Any] | None:
+    """Retrieve the serialized supervisor thread state from the session envelope, if present."""
+
+    agent_state = session_state.get("agent_framework")
+    if isinstance(agent_state, dict):
+        thread_state = agent_state.get("supervisor_thread")
+        if isinstance(thread_state, MutableMapping):
+            return thread_state
+    return None
+
+
+def store_supervisor_thread_state(
+    session_state: dict[str, Any],
+    thread_state: MutableMapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Persist a serialized supervisor thread back into the session envelope."""
+
+    if thread_state is None:
+        return session_state
+
+    agent_state = session_state.get("agent_framework")
+    if not isinstance(agent_state, dict):
+        agent_state = {}
+        session_state["agent_framework"] = agent_state
+    agent_state["supervisor_thread"] = thread_state
+    return session_state
+

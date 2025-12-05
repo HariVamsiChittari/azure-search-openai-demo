@@ -790,6 +790,63 @@ async def search(
 ) -> str:
 ```
 
+### 7.5 AgentThread Persistence and Session State
+
+The orchestrator keeps multi-turn memory alive by serializing the Microsoft Agent Framework `AgentThread` into the regular `/chat` `session_state` payload. This makes thread management transparent to the frontend and keeps compatibility with Cosmos/browser history.
+
+**Session envelope structure**
+
+```json
+{
+  "id": "<chat-history-id>",
+  "agent_framework": {
+    "supervisor_thread": {
+      "service_thread_id": "thread_abc123",
+      "chat_message_store_state": { "messages": [ ... ] }
+    }
+  }
+}
+```
+
+- `id` stays available for history providers.
+- `agent_framework.supervisor_thread` stores the serialized `AgentThreadState` produced by `await thread.serialize()`.
+- When no prior state exists the field is omitted and the supervisor starts a new thread.
+
+**Normalization utilities (agent_orchestrator.py)**
+
+```python
+def normalize_session_state(session_state: Any) -> dict[str, Any]:
+    normalized = dict(session_state) if isinstance(session_state, dict) else {}
+    if session_state and not isinstance(session_state, dict):
+        normalized["id"] = session_state
+    normalized.setdefault("agent_framework", {})
+    return normalized
+
+def get_supervisor_thread_state(session_state: dict[str, Any]) -> MutableMapping[str, Any] | None:
+    agent_state = session_state.get("agent_framework")
+    if isinstance(agent_state, dict):
+        thread_state = agent_state.get("supervisor_thread")
+        if isinstance(thread_state, MutableMapping):
+            return thread_state
+    return None
+
+def store_supervisor_thread_state(session_state: dict[str, Any], thread_state: MutableMapping[str, Any] | None) -> dict[str, Any]:
+    if thread_state is None:
+        return session_state
+    agent_state = session_state.setdefault("agent_framework", {})
+    agent_state["supervisor_thread"] = thread_state
+    return session_state
+```
+
+**Lifecycle**
+
+1. `_get_thread_from_session_state` pulls the serialized thread (if any) and hydrates it via `self.supervisor_agent.deserialize_thread(...)`. Failures are logged and a fresh thread is created to avoid blocking the user.
+2. `supervisor_agent.run(...)` or `.run_stream(...)` executes inside that thread, so tool calls automatically append to the same context.
+3. `_persist_thread_state` serializes the updated thread and places it back into the session envelope before the response is returned. The UI simply echoes whatever `session_state` it receives on the next request.
+4. `run_stream` now mirrors `run` by wrapping `run_with_streaming(...)` in try/except. If the agent stack fails, the method logs the exception and falls back to `chat_approach.run_stream`. Users still receive a response and the legacy RAG pipeline handles the turn.
+
+Frontend helpers `normalizeSessionStateForRequest` and `getHistoryId` (both in `Chat.tsx`) treat the envelope as opaque data, ensuring browser/Cosmos history only needs the `id` while still forwarding the richer agent thread metadata.
+
 ---
 
 ## 8. Technologies and Libraries

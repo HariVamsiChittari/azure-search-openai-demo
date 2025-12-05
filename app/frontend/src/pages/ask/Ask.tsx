@@ -5,7 +5,7 @@ import { Panel, DefaultButton, Spinner } from "@fluentui/react";
 
 import styles from "./Ask.module.css";
 
-import { askApi, configApi, ChatAppResponse, ChatAppRequest, RetrievalMode, SpeechConfig } from "../../api";
+import { askApi, configApi, ChatAppResponse, ChatAppRequest, RetrievalMode, SpeechConfig, SessionState } from "../../api";
 import { Answer, AnswerError } from "../../components/Answer";
 import { QuestionInput } from "../../components/QuestionInput";
 import { ExampleList } from "../../components/Example";
@@ -18,6 +18,16 @@ import { useMsal } from "@azure/msal-react";
 import { TokenClaimsDisplay } from "../../components/TokenClaimsDisplay";
 import { LoginContext } from "../../loginContext";
 import { LanguagePicker } from "../../i18n/LanguagePicker";
+
+const normalizeSessionStateForRequest = (state: SessionState | null): SessionState | null => {
+    if (state === null || typeof state === "string") {
+        return state;
+    }
+    if (Object.keys(state).length === 0) {
+        return null;
+    }
+    return state;
+};
 
 export function Component(): JSX.Element {
     const [isConfigPanelOpen, setIsConfigPanelOpen] = useState(false);
@@ -178,7 +188,7 @@ export function Component(): JSX.Element {
                     }
                 },
                 // AI Chat Protocol: Client must pass on any session state received from the server
-                session_state: answer ? answer.session_state : null
+                session_state: normalizeSessionStateForRequest(answer ? answer.session_state : null)
             };
             const result = await askApi(request, token);
             setAnswer(result);

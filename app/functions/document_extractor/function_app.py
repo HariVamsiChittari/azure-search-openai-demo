@@ -103,11 +103,9 @@ def configure_global_settings():
 @app.function_name(name="extract")
 @app.route(route="extract", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
-    """Azure Search Custom Skill: Extract document content"""
-    start_time = time.time()
-    file_name = "unknown"
-    file_size_mb = 0.0
-    status = "unknown"
+    """Azure Search Custom Skill: Extract document content (supports multiple batches)"""
+    batch_start_time = time.time()
+    batch_id = f"batch_{int(batch_start_time)}"
     
     if settings is None:
         return func.HttpResponse(
@@ -120,89 +118,122 @@ async def extract_document(req: func.HttpRequest) -> func.HttpResponse:
         # Parse custom skill input
         req_body = req.get_json()
         input_values = req_body.get("values", [])
-
-        if len(input_values) != 1:
-            raise ValueError("document_extractor expects exactly one record per request, set batchSize to 1.")
-
-        input_record = input_values[0]
-        record_id = input_record.get("recordId", "")
-        data = input_record.get("data", {})
-
-        # Extract file name early for metrics
-        file_name = (
-            data.get("metadata_storage_name") or 
-            data.get("file_name") or 
-            data.get("fileName") or
-            "unknown"
-        )
+        batch_size = len(input_values)
         
+        if batch_size == 0:
+            raise ValueError("No input records provided")
+
         logger.info(
-            "[METRICS] function=document_extractor | operation=start | file=%s | recordId=%s",
-            file_name, record_id
+            "[METRICS] function=document_extractor | operation=batch_start | batch_id=%s | batch_size=%d",
+            batch_id, batch_size
         )
 
-        try:
-            process_start = time.time()
-            result, file_size_mb = await process_document(data)
-            process_duration = time.time() - process_start
-            
-            num_pages = len(result.get("pages", []))
-            num_figures = len(result.get("figures", []))
-            status = "success"
-            
-            logger.info(
-                "[METRICS] function=document_extractor | operation=processing_complete | file=%s | status=%s | "
-                "duration_sec=%.2f | pages=%d | figures=%d | size_mb=%.2f",
-                file_name, status, process_duration, num_pages, num_figures, file_size_mb
+        output_values = []
+        batch_stats = {
+            "total_files": 0,
+            "successful_files": 0,
+            "failed_files": 0,
+            "total_pages": 0,
+            "total_figures": 0,
+            "total_size_mb": 0.0,
+            "processing_times": []
+        }
+
+        # Process each record in the batch
+        for idx, input_record in enumerate(input_values):
+            record_start_time = time.time()
+            record_id = input_record.get("recordId", f"record_{idx}")
+            data = input_record.get("data", {})
+
+            # Extract file name for metrics
+            file_name = (
+                data.get("metadata_storage_name") or 
+                data.get("file_name") or 
+                data.get("fileName") or
+                f"unknown_file_{idx}"
             )
             
-            output_values = [
-                {
+            batch_stats["total_files"] += 1
+            
+            logger.info(
+                "[METRICS] function=document_extractor | operation=record_start | batch_id=%s | record_idx=%d | "
+                "file=%s | recordId=%s",
+                batch_id, idx, file_name, record_id
+            )
+
+            try:
+                process_start = time.time()
+                result, file_size_mb = await process_document(data)
+                process_duration = time.time() - process_start
+                
+                num_pages = len(result.get("pages", []))
+                num_figures = len(result.get("figures", []))
+                
+                # Update batch statistics
+                batch_stats["successful_files"] += 1
+                batch_stats["total_pages"] += num_pages
+                batch_stats["total_figures"] += num_figures
+                batch_stats["total_size_mb"] += file_size_mb
+                batch_stats["processing_times"].append(process_duration)
+                
+                logger.info(
+                    "[METRICS] function=document_extractor | operation=record_success | batch_id=%s | record_idx=%d | "
+                    "file=%s | duration_sec=%.2f | pages=%d | figures=%d | size_mb=%.2f",
+                    batch_id, idx, file_name, process_duration, num_pages, num_figures, file_size_mb
+                )
+                
+                output_values.append({
                     "recordId": record_id,
                     "data": result,
                     "errors": [],
                     "warnings": [],
-                }
-            ]
-        except Exception as e:
-            logger.error("Error processing record %s: %s", record_id, str(e), exc_info=True)
-            process_duration = time.time() - start_time
-            status = "error"
-            error_type = type(e).__name__
-            
-            logger.error(
-                "[METRICS] function=document_extractor | operation=processing_complete | file=%s | status=%s | "
-                "duration_sec=%.2f | size_mb=%.2f | error_type=%s | error_message=%s",
-                file_name, status, process_duration, file_size_mb, error_type, str(e), exc_info=True
-            )
-            
-            output_values = [
-                {
+                })
+                
+            except Exception as e:
+                process_duration = time.time() - record_start_time
+                batch_stats["failed_files"] += 1
+                batch_stats["processing_times"].append(process_duration)
+                error_type = type(e).__name__
+                
+                logger.error(
+                    "[METRICS] function=document_extractor | operation=record_error | batch_id=%s | record_idx=%d | "
+                    "file=%s | duration_sec=%.2f | error_type=%s | error_message=%s",
+                    batch_id, idx, file_name, process_duration, error_type, str(e), exc_info=True
+                )
+                
+                output_values.append({
                     "recordId": record_id,
                     "data": {},
                     "errors": [{"message": str(e)}],
                     "warnings": [],
-                }
-            ]
+                })
 
-        total_duration = time.time() - start_time
+        # Log batch completion metrics
+        batch_duration = time.time() - batch_start_time
+        avg_processing_time = sum(batch_stats["processing_times"]) / max(len(batch_stats["processing_times"]), 1)
+        success_rate = (batch_stats["successful_files"] / batch_stats["total_files"]) * 100
+        total_throughput_mbps = batch_stats["total_size_mb"] / max(batch_duration, 0.001)
+        
         logger.info(
-            "[METRICS] function=document_extractor | operation=request_complete | file=%s | status=%s | "
-            "total_duration_sec=%.2f | size_mb=%.2f",
-            file_name, status, total_duration, file_size_mb
+            "[METRICS] function=document_extractor | operation=batch_complete | batch_id=%s | "
+            "batch_size=%d | successful=%d | failed=%d | success_rate=%.1f%% | "
+            "total_duration_sec=%.2f | avg_processing_sec=%.2f | total_pages=%d | total_figures=%d | "
+            "total_size_mb=%.2f | throughput_mbps=%.2f",
+            batch_id, batch_stats["total_files"], batch_stats["successful_files"], batch_stats["failed_files"],
+            success_rate, batch_duration, avg_processing_time, batch_stats["total_pages"], 
+            batch_stats["total_figures"], batch_stats["total_size_mb"], total_throughput_mbps
         )
         
         return func.HttpResponse(json.dumps({"values": output_values}), mimetype="application/json", status_code=200)
 
     except Exception as e:
-        total_duration = time.time() - start_time
-        status = "fatal_error"
+        batch_duration = time.time() - batch_start_time
         error_type = type(e).__name__
         
         logger.error(
-            "[METRICS] function=document_extractor | operation=request_complete | file=%s | status=%s | "
-            "total_duration_sec=%.2f | size_mb=%.2f | error_type=%s | error_message=%s",
-            file_name, status, total_duration, file_size_mb, error_type, str(e), exc_info=True
+            "[METRICS] function=document_extractor | operation=batch_fatal_error | batch_id=%s | "
+            "duration_sec=%.2f | error_type=%s | error_message=%s",
+            batch_id, batch_duration, error_type, str(e), exc_info=True
         )
         
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
@@ -218,10 +249,8 @@ async def process_document(data: dict[str, Any]) -> tuple[dict[str, Any], float]
         ", ".join(data.keys()) if data else "none"
     )
     
-    # Try file_data first (for small files), fall back to blob URL (for large files)
-    if "file_data" in data and data.get("file_data", {}).get("data"):
-        document_stream, file_name, content_type = get_document_stream_filedata(data)
-    elif "metadata_storage_path" in data:
+
+    if "metadata_storage_path" in data:
         document_stream, file_name, content_type = await get_document_stream_from_blob_url(data, "metadata_storage_path")
     elif "normalized_images" in data and "metadata_storage_path" in data.get("normalized_images", {}):
         # Handle Azure Search normalized_images format
@@ -359,35 +388,6 @@ async def get_document_stream_from_blob_url(data: dict[str, Any], url_field: str
         raise ValueError(f"Failed to download from blob storage: {str(e)}") from e
 
 
-def get_document_stream_filedata(data: dict[str, Any]) -> tuple[io.BytesIO, str, str]:
-    """Return a BytesIO stream for file_data input only (skillset must send file bytes)."""
-    file_payload = data.get("file_data", {})
-    
-    if not file_payload:
-        raise ValueError("file_data field is empty or missing")
-    
-    encoded = file_payload.get("data")
-    if not encoded:
-        raise ValueError(
-            "file_data payload missing base64 data. "
-            "This typically means the file exceeds the 16MB limit for inline data. "
-            "Update your skillset to pass 'metadata_storage_path' instead."
-        )
-    
-    try:
-        document_bytes = base64.b64decode(encoded)
-        logger.info(
-            "[METRICS] function=document_extractor | operation=base64_decode_complete | size_bytes=%d",
-            len(document_bytes)
-        )
-    except Exception as e:
-        raise ValueError(f"Failed to decode base64 data: {str(e)}") from e
-    
-    file_name = data.get("file_name") or data.get("fileName") or file_payload.get("name") or "document"
-    content_type = data.get("contentType") or file_payload.get("contentType") or "application/octet-stream"
-    stream = io.BytesIO(document_bytes)
-    stream.name = file_name
-    return stream, file_name, content_type
 
 
 async def build_document_components(file_name: str, pages: list[Page], upload_images: bool = False) -> dict[str, Any]:
